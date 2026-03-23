@@ -6,7 +6,7 @@ GO ?= go
 GOCACHE ?= /tmp/cview-gocache
 GOMODCACHE ?= /tmp/cview-gomodcache
 
-.PHONY: build run test fmt tidy clean
+.PHONY: build run test fmt tidy lint clean
 
 build:
 	mkdir -p $(BIN_DIR)
@@ -23,6 +23,9 @@ fmt:
 
 tidy:
 	GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) $(GO) mod tidy
+
+lint: 
+	golangci-lint run
 
 clean:
 	rm -rf $(BIN_DIR)
