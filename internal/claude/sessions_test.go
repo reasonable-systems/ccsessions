@@ -190,34 +190,34 @@ func mustMarshal(t *testing.T, v any) json.RawMessage {
 
 func TestSummarizeToolInput(t *testing.T) {
 	cases := []struct {
-		name      string
-		toolName  string
-		input     map[string]any
+		name         string
+		toolName     string
+		input        map[string]any
 		wantContains string // substring that must appear in result
-		wantExact string   // exact match (if set, checked instead of wantContains)
+		wantExact    string // exact match (if set, checked instead of wantContains)
 	}{
 		{
-			name:     "Bash with command and description",
-			toolName: "Bash",
-			input:    map[string]any{"command": "ls -la", "description": "list files"},
+			name:      "Bash with command and description",
+			toolName:  "Bash",
+			input:     map[string]any{"command": "ls -la", "description": "list files"},
 			wantExact: "list files  ls -la",
 		},
 		{
-			name:     "Read with file_path",
-			toolName: "Read",
-			input:    map[string]any{"file_path": "/some/path.go"},
+			name:      "Read with file_path",
+			toolName:  "Read",
+			input:     map[string]any{"file_path": "/some/path.go"},
 			wantExact: "/some/path.go",
 		},
 		{
-			name:     "WebSearch with query",
-			toolName: "WebSearch",
-			input:    map[string]any{"query": "golang testing"},
+			name:      "WebSearch with query",
+			toolName:  "WebSearch",
+			input:     map[string]any{"query": "golang testing"},
 			wantExact: "golang testing",
 		},
 		{
-			name:     "unknown tool falls back to key=value pairs",
-			toolName: "UnknownTool",
-			input:    map[string]any{"alpha": "val1", "beta": "val2"},
+			name:         "unknown tool falls back to key=value pairs",
+			toolName:     "UnknownTool",
+			input:        map[string]any{"alpha": "val1", "beta": "val2"},
 			wantContains: "alpha=val1",
 		},
 	}
