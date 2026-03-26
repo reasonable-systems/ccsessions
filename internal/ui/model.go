@@ -28,8 +28,7 @@ var (
 				Bold(true).
 				Foreground(lipgloss.Color("230")).
 				Background(lipgloss.Color("236")).
-				Padding(0, 1).
-				MarginLeft(3)
+				Padding(0, 1)
 	assistantBlockStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("252"))
 	toolCallStyle = lipgloss.NewStyle().
@@ -39,13 +38,11 @@ var (
 	toolResultStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("250")).
 			Background(lipgloss.Color("235")).
-			Padding(0, 1).
-			MarginLeft(2)
+			Padding(0, 1)
 	toolErrorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("230")).
 			Background(lipgloss.Color("124")).
-			Padding(0, 1).
-			MarginLeft(2)
+			Padding(0, 1)
 	progressStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("109"))
 	metaStyle = lipgloss.NewStyle().
@@ -58,7 +55,14 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("240")).
 			Padding(0, 1)
-	detailStyle = listStyle
+	detailStyle      = listStyle
+	searchMatchStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("58")).
+				Foreground(lipgloss.Color("230"))
+	searchMatchActiveStyle = lipgloss.NewStyle().
+				Bold(true).
+				Background(lipgloss.Color("220")).
+				Foreground(lipgloss.Color("16"))
 )
 
 type focusTarget int
@@ -69,20 +73,57 @@ const (
 	focusDetails
 )
 
+type detailLineKind int
+
+const (
+	detailLinePlain detailLineKind = iota
+	detailLineTitle
+	detailLineSectionTitle
+	detailLineMuted
+	detailLinePromptHeader
+	detailLinePromptBody
+	detailLineAssistantHeader
+	detailLineAssistantBody
+	detailLineToolCallHeader
+	detailLineToolCallBody
+	detailLineToolResultHeader
+	detailLineToolResultBody
+	detailLineToolErrorBody
+	detailLineProgress
+	detailLineMeta
+)
+
+type detailLine struct {
+	text string
+	kind detailLineKind
+}
+
+type detailMatch struct {
+	line  int
+	start int
+	end   int
+}
+
 type Model struct {
-	search        textinput.Model
-	list          viewport.Model
-	details       viewport.Model
-	sessions      []claude.Session
-	filtered      []claude.Session
-	selected      int
-	width         int
-	height        int
-	err           error
-	focus         focusTarget
-	projectFolder string
-	debug         bool
-	discovery     claude.DiscoveryInfo
+	search              textinput.Model
+	detailSearch        textinput.Model
+	list                viewport.Model
+	details             viewport.Model
+	sessions            []claude.Session
+	filtered            []claude.Session
+	selected            int
+	width               int
+	height              int
+	err                 error
+	focus               focusTarget
+	projectFolder       string
+	debug               bool
+	discovery           claude.DiscoveryInfo
+	detailLines         []detailLine
+	detailMatches       []detailMatch
+	detailSearchActive  bool
+	detailSearchEditing bool
+	activeDetailMatch   int
 }
 
 func NewModel(claudeDir string, debug bool) (Model, error) {
@@ -97,12 +138,13 @@ func NewModel(claudeDir string, debug bool) (Model, error) {
 	}
 
 	model := Model{
-		search:    search,
-		sessions:  sessions,
-		filtered:  sessions,
-		focus:     focusSearch,
-		debug:     debug,
-		discovery: discovery,
+		search:       search,
+		detailSearch: newDetailSearchInput(),
+		sessions:     sessions,
+		filtered:     sessions,
+		focus:        focusSearch,
+		debug:        debug,
+		discovery:    discovery,
 	}
 	model.projectFolder = currentProjectDir(sessions)
 	model.list = viewport.New(0, 0)
@@ -110,6 +152,14 @@ func NewModel(claudeDir string, debug bool) (Model, error) {
 	model.syncList()
 	model.syncDetails(true)
 	return model, nil
+}
+
+func newDetailSearchInput() textinput.Model {
+	search := textinput.New()
+	search.Prompt = "/"
+	search.Placeholder = "search"
+	search.CharLimit = 0
+	return search
 }
 
 func (m Model) Init() tea.Cmd {
@@ -145,6 +195,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case focusDetails:
+			if handled, cmd := m.updateDetailSearch(msg); handled {
+				return m, cmd
+			}
+
 			var vpCmd tea.Cmd
 			m.details, vpCmd = m.details.Update(msg)
 			return m, vpCmd
@@ -162,6 +216,76 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *Model) updateDetailSearch(msg tea.KeyMsg) (bool, tea.Cmd) {
+	switch msg.String() {
+	case "/":
+		m.activateDetailSearch()
+		return true, nil
+	case "esc":
+		if m.detailSearchEditing || m.detailSearchActive {
+			m.clearDetailSearch()
+			return true, nil
+		}
+	case "enter":
+		if m.detailSearchEditing {
+			m.detailSearchEditing = false
+			m.detailSearch.Blur()
+			m.detailSearchActive = strings.TrimSpace(m.detailSearch.Value()) != ""
+			m.refreshDetailViewport(false)
+			return true, nil
+		}
+	case "up":
+		if m.detailSearchActive {
+			m.moveDetailMatch(-1)
+			return true, nil
+		}
+	case "down":
+		if m.detailSearchActive {
+			m.moveDetailMatch(1)
+			return true, nil
+		}
+	}
+
+	if !m.detailSearchEditing {
+		return false, nil
+	}
+
+	var cmd tea.Cmd
+	prev := m.detailSearch.Value()
+	m.detailSearch, cmd = m.detailSearch.Update(msg)
+	if m.detailSearch.Value() != prev {
+		m.detailSearchActive = strings.TrimSpace(m.detailSearch.Value()) != ""
+		m.recomputeDetailMatches(true)
+	}
+	return true, cmd
+}
+
+func (m *Model) activateDetailSearch() {
+	m.detailSearchEditing = true
+	m.detailSearchActive = strings.TrimSpace(m.detailSearch.Value()) != ""
+	m.detailSearch.Focus()
+	m.refreshDetailViewport(false)
+}
+
+func (m *Model) clearDetailSearch() {
+	m.detailSearch.SetValue("")
+	m.detailSearchActive = false
+	m.detailSearchEditing = false
+	m.detailSearch.Blur()
+	m.detailMatches = nil
+	m.activeDetailMatch = 0
+	m.refreshDetailViewport(false)
+}
+
+func (m *Model) moveDetailMatch(delta int) {
+	if len(m.detailMatches) == 0 {
+		return
+	}
+	m.activeDetailMatch = (m.activeDetailMatch + delta + len(m.detailMatches)) % len(m.detailMatches)
+	m.scrollToActiveMatch()
+	m.refreshDetailViewport(false)
 }
 
 func (m Model) View() string {
@@ -182,7 +306,7 @@ func (m Model) View() string {
 
 	leftWidth, rightWidth, panelHeight := m.panelDimensions()
 	list := m.panelStyle(focusList).Width(leftWidth).Height(panelHeight).Render(m.list.View())
-	detail := m.panelStyle(focusDetails).Width(rightWidth).Height(panelHeight).Render(m.details.View())
+	detail := m.panelStyle(focusDetails).Width(rightWidth).Height(panelHeight).Render(m.renderDetailPanel())
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, list, detail)
 
@@ -190,7 +314,7 @@ func (m Model) View() string {
 		strings.Join(header, "  "),
 		m.search.View(),
 		body,
-		mutedStyle.Render("Controls: Tab cycles focus, j/k or arrows move or scroll in the focused pane, q quits"),
+		mutedStyle.Render("Controls: Tab cycles focus, j/k or arrows move or scroll, / searches session log, Enter keeps search, Esc clears, q quits"),
 	}, "\n\n"))
 }
 
@@ -252,45 +376,78 @@ func (m *Model) syncList() {
 }
 
 func (m *Model) syncDetails(resetScroll bool) {
+	m.detailLines = m.buildDetailLines()
+	m.recomputeDetailMatches(resetScroll)
+}
+
+func (m *Model) buildDetailLines() []detailLine {
+	width := max(20, m.details.Width)
+
 	if len(m.filtered) == 0 {
-		m.details.SetContent("No sessions matched the current filter.")
-		if resetScroll {
-			m.details.GotoTop()
-		}
-		return
+		return []detailLine{{text: "No sessions matched the current filter.", kind: detailLineMuted}}
 	}
 
 	selected := m.filtered[m.selected]
-	lines := []string{
-		titleStyle.Render(selected.Summary),
-		wrapLabelValue("Session", selected.ID, max(20, m.details.Width)),
-		wrapLabelValue("Updated", formatTime(selected.UpdatedAt), max(20, m.details.Width)),
+	lines := []detailLine{
+		{text: selected.Summary, kind: detailLineTitle},
 	}
+
+	lines = append(lines, wrapDetailLabelValue("Session", selected.ID, width, detailLinePlain)...)
+	lines = append(lines, wrapDetailLabelValue("Updated", formatTime(selected.UpdatedAt), width, detailLinePlain)...)
 	if !selected.StartedAt.IsZero() {
-		lines = append(lines, wrapLabelValue("Started", formatTime(selected.StartedAt), max(20, m.details.Width)))
+		lines = append(lines, wrapDetailLabelValue("Started", formatTime(selected.StartedAt), width, detailLinePlain)...)
 	}
 	if selected.Branch != "" {
-		lines = append(lines, wrapLabelValue("Branch", selected.Branch, max(20, m.details.Width)))
+		lines = append(lines, wrapDetailLabelValue("Branch", selected.Branch, width, detailLinePlain)...)
 	}
 	if selected.CWD != "" {
-		lines = append(lines, wrapLabelValue("CWD", selected.CWD, max(20, m.details.Width)))
+		lines = append(lines, wrapDetailLabelValue("CWD", selected.CWD, width, detailLinePlain)...)
 	}
+
 	lines = append(lines,
-		fmt.Sprintf("Messages: %d total, %d user, %d assistant", selected.MessageCount, selected.UserPrompts, selected.AssistantMsgs),
-		wrapLabelValue("File", selected.Path, max(20, m.details.Width)),
-		"",
-		sectionTitleStyle.Render("Full Session Log"),
+		detailLine{text: fmt.Sprintf("Messages: %d total, %d user, %d assistant", selected.MessageCount, selected.UserPrompts, selected.AssistantMsgs), kind: detailLinePlain},
+	)
+	lines = append(lines, wrapDetailLabelValue("File", selected.Path, width, detailLinePlain)...)
+	lines = append(lines,
+		detailLine{text: "", kind: detailLinePlain},
+		detailLine{text: "Full Session Log", kind: detailLineSectionTitle},
 	)
 
 	for _, entry := range selected.Transcript {
-		lines = append(lines, m.renderEntry(entry))
-		lines = append(lines, "")
+		lines = append(lines, m.renderEntryLines(entry)...)
+		lines = append(lines, detailLine{text: "", kind: detailLinePlain})
 	}
 
-	m.details.SetContent(strings.Join(lines, "\n"))
+	return lines
+}
+
+func (m *Model) refreshDetailViewport(resetScroll bool) {
+	m.details.SetContent(m.renderDetailViewportContent())
 	if resetScroll {
 		m.details.GotoTop()
+		return
 	}
+	if m.detailSearchActive && len(m.detailMatches) > 0 {
+		m.scrollToActiveMatch()
+		return
+	}
+	m.clampDetailOffset()
+}
+
+func (m *Model) recomputeDetailMatches(resetSelection bool) {
+	query := strings.TrimSpace(m.detailSearch.Value())
+	if query == "" {
+		m.detailMatches = nil
+		m.activeDetailMatch = 0
+		m.refreshDetailViewport(resetSelection)
+		return
+	}
+
+	m.detailMatches = findDetailMatches(m.detailLines, query)
+	if resetSelection || m.activeDetailMatch >= len(m.detailMatches) {
+		m.activeDetailMatch = 0
+	}
+	m.refreshDetailViewport(resetSelection && len(m.detailMatches) == 0)
 }
 
 func (m *Model) resize() {
@@ -299,7 +456,7 @@ func (m *Model) resize() {
 	m.list.Width = max(1, leftWidth-horizontalFrame)
 	m.list.Height = max(1, panelHeight-verticalFrame)
 	m.details.Width = max(1, rightWidth-horizontalFrame)
-	m.details.Height = max(1, panelHeight-verticalFrame)
+	m.details.Height = max(1, panelHeight-verticalFrame-1)
 	m.syncList()
 	m.syncDetails(false)
 }
@@ -327,6 +484,10 @@ func (m *Model) cycleFocus(delta int) {
 		return
 	}
 	m.search.Blur()
+	if m.focus != focusDetails {
+		m.detailSearchEditing = false
+		m.detailSearch.Blur()
+	}
 }
 
 func (m Model) panelStyle(target focusTarget) lipgloss.Style {
@@ -378,6 +539,71 @@ func (m *Model) ensureListSelectionVisible() {
 	}
 }
 
+func (m Model) renderDetailPanel() string {
+	return strings.Join([]string{
+		m.details.View(),
+		m.renderDetailFooter(),
+	}, "\n")
+}
+
+func (m Model) renderDetailFooter() string {
+	width := max(1, m.details.Width)
+	if !m.detailSearchActive && !m.detailSearchEditing {
+		return mutedStyle.Width(width).Render("Press / to search this session log")
+	}
+
+	left := m.detailSearch.View()
+	right := fmt.Sprintf("%d of %d", m.activeDetailMatch+1, len(m.detailMatches))
+	if len(m.detailMatches) == 0 {
+		right = "0 of 0"
+	}
+
+	leftWidth := lipgloss.Width(left)
+	rightWidth := lipgloss.Width(right)
+	if leftWidth+rightWidth >= width {
+		return lipgloss.NewStyle().Width(width).Render(left)
+	}
+
+	padding := strings.Repeat(" ", width-leftWidth-rightWidth)
+	return lipgloss.NewStyle().Width(width).Render(left + padding + mutedStyle.Render(right))
+}
+
+func (m Model) renderDetailViewportContent() string {
+	if len(m.detailLines) == 0 {
+		return ""
+	}
+
+	matchesByLine := groupMatchesByLine(m.detailMatches)
+	lines := make([]string, 0, len(m.detailLines))
+	for index, line := range m.detailLines {
+		lines = append(lines, renderDetailLine(line, matchesByLine[index], m.activeDetailMatch))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) scrollToActiveMatch() {
+	if len(m.detailMatches) == 0 {
+		return
+	}
+
+	line := m.detailMatches[m.activeDetailMatch].line
+	maxOffset := max(0, len(m.detailLines)-m.details.Height)
+	if line > maxOffset {
+		line = maxOffset
+	}
+	m.details.SetYOffset(line)
+}
+
+func (m *Model) clampDetailOffset() {
+	maxOffset := max(0, len(m.detailLines)-m.details.Height)
+	if m.details.YOffset > maxOffset {
+		m.details.SetYOffset(maxOffset)
+	}
+	if m.details.YOffset < 0 {
+		m.details.SetYOffset(0)
+	}
+}
+
 func sessionMeta(session claude.Session, width int) string {
 	bits := []string{formatTime(session.UpdatedAt)}
 	if session.Branch != "" {
@@ -411,13 +637,26 @@ func truncate(value string, width int) string {
 	return string(runes[:width-3]) + "..."
 }
 
-func wrapLabelValue(label, value string, width int) string {
-	return wrapText(fmt.Sprintf("%s: %s", label, value), width)
+func wrapDetailLabelValue(label, value string, width int, kind detailLineKind) []detailLine {
+	return wrapDetailText(fmt.Sprintf("%s: %s", label, value), width, kind)
+}
+
+func wrapDetailText(value string, width int, kind detailLineKind) []detailLine {
+	lines := wrapTextLines(value, width)
+	out := make([]detailLine, 0, len(lines))
+	for _, line := range lines {
+		out = append(out, detailLine{text: line, kind: kind})
+	}
+	return out
 }
 
 func wrapText(value string, width int) string {
+	return strings.Join(wrapTextLines(value, width), "\n")
+}
+
+func wrapTextLines(value string, width int) []string {
 	if width <= 0 {
-		return value
+		return []string{value}
 	}
 
 	sourceLines := strings.Split(strings.TrimRight(value, "\n"), "\n")
@@ -446,79 +685,96 @@ func wrapText(value string, width int) string {
 		wrapped = append(wrapped, current)
 	}
 
-	return strings.Join(wrapped, "\n")
+	if len(wrapped) == 0 {
+		return []string{""}
+	}
+	return wrapped
 }
 
-func (m Model) renderEntry(entry claude.Entry) string {
+func (m Model) renderEntryLines(entry claude.Entry) []detailLine {
 	width := max(20, m.details.Width)
 	switch entry.Kind {
 	case claude.EntryHumanPrompt:
-		return renderPromptEntry(entry, width)
+		return renderPromptLines(entry, width)
 	case claude.EntryAssistantText:
-		return renderAssistantEntry(entry, width)
+		return renderAssistantLines(entry, width)
 	case claude.EntryToolCall:
-		return renderToolCallEntry(entry, width)
+		return renderToolCallLines(entry, width)
 	case claude.EntryToolResult:
-		return renderToolResultEntry(entry, width)
+		return renderToolResultLines(entry, width)
 	case claude.EntryThinking:
-		return renderThinkingEntry(entry, width)
+		return renderThinkingLines(entry, width)
 	case claude.EntryProgress:
-		return renderProgressEntry(entry, width)
+		return renderProgressLines(entry, width)
 	case claude.EntryMeta:
-		return renderMetaEntry(entry, width)
+		return renderMetaLines(entry, width)
 	default:
-		return wrapText(entry.Content, width)
+		return wrapDetailText(entry.Content, width, detailLinePlain)
 	}
 }
 
-func renderPromptEntry(entry claude.Entry, width int) string {
-	header := mutedStyle.Render(fmt.Sprintf("Prompt  %s", formatTime(entry.Timestamp)))
-	body := promptBlockStyle.MaxWidth(max(10, width-3)).Render(wrapText(entry.Content, max(10, width-7)))
-	return strings.Join([]string{header, body}, "\n")
+func renderPromptLines(entry claude.Entry, width int) []detailLine {
+	lines := []detailLine{{
+		text: fmt.Sprintf("Prompt  %s", formatTime(entry.Timestamp)),
+		kind: detailLinePromptHeader,
+	}}
+	lines = append(lines, wrapDetailText(entry.Content, max(10, width-4), detailLinePromptBody)...)
+	return lines
 }
 
-func renderAssistantEntry(entry claude.Entry, width int) string {
-	header := mutedStyle.Render(fmt.Sprintf("Assistant  %s", formatTime(entry.Timestamp)))
-	body := assistantBlockStyle.Render(wrapText(entry.Content, width))
-	return strings.Join([]string{header, body}, "\n")
+func renderAssistantLines(entry claude.Entry, width int) []detailLine {
+	lines := []detailLine{{
+		text: fmt.Sprintf("Assistant  %s", formatTime(entry.Timestamp)),
+		kind: detailLineAssistantHeader,
+	}}
+	lines = append(lines, wrapDetailText(entry.Content, width, detailLineAssistantBody)...)
+	return lines
 }
 
-func renderToolCallEntry(entry claude.Entry, width int) string {
+func renderToolCallLines(entry claude.Entry, width int) []detailLine {
 	title := firstNonEmpty(entry.Title, "Tool Call")
-	header := mutedStyle.Render(fmt.Sprintf("%s  %s", title, formatTime(entry.Timestamp)))
-	body := toolCallStyle.MaxWidth(width).Render(wrapText(entry.Content, max(10, width-2)))
-	return strings.Join([]string{header, body}, "\n")
+	lines := []detailLine{{
+		text: fmt.Sprintf("%s  %s", title, formatTime(entry.Timestamp)),
+		kind: detailLineToolCallHeader,
+	}}
+	lines = append(lines, wrapDetailText(entry.Content, max(10, width-2), detailLineToolCallBody)...)
+	return lines
 }
 
-func renderToolResultEntry(entry claude.Entry, width int) string {
+func renderToolResultLines(entry claude.Entry, width int) []detailLine {
 	headerLabel := "Tool Result"
+	bodyKind := detailLineToolResultBody
 	if entry.IsError {
 		headerLabel = "Tool Error"
+		bodyKind = detailLineToolErrorBody
 	}
-	header := mutedStyle.Render(fmt.Sprintf("%s  %s", headerLabel, formatTime(entry.Timestamp)))
-	contentWidth := max(10, width-4)
-	bodyText := wrapText(entry.Content, contentWidth)
-	if entry.IsError {
-		return strings.Join([]string{header, toolErrorStyle.MaxWidth(max(10, width-2)).Render(bodyText)}, "\n")
-	}
-	return strings.Join([]string{header, toolResultStyle.MaxWidth(max(10, width-2)).Render(bodyText)}, "\n")
+
+	lines := []detailLine{{
+		text: fmt.Sprintf("%s  %s", headerLabel, formatTime(entry.Timestamp)),
+		kind: detailLineToolResultHeader,
+	}}
+	lines = append(lines, wrapDetailText(entry.Content, max(10, width-2), bodyKind)...)
+	return lines
 }
 
-func renderThinkingEntry(entry claude.Entry, width int) string {
+func renderThinkingLines(entry claude.Entry, width int) []detailLine {
 	label := firstNonEmpty(entry.Title, "Thinking")
-	return progressStyle.Render(truncate(label+"  "+formatTime(entry.Timestamp), width))
+	return []detailLine{{
+		text: truncate(label+"  "+formatTime(entry.Timestamp), width),
+		kind: detailLineProgress,
+	}}
 }
 
-func renderProgressEntry(entry claude.Entry, width int) string {
+func renderProgressLines(entry claude.Entry, width int) []detailLine {
 	label := firstNonEmpty(entry.Title, "Progress")
 	text := label
 	if strings.TrimSpace(entry.Content) != "" && entry.Content != label {
 		text += "  " + oneLineForUI(entry.Content)
 	}
-	return progressStyle.Render(wrapText(text+"  "+formatTime(entry.Timestamp), width))
+	return wrapDetailText(text+"  "+formatTime(entry.Timestamp), width, detailLineProgress)
 }
 
-func renderMetaEntry(entry claude.Entry, width int) string {
+func renderMetaLines(entry claude.Entry, width int) []detailLine {
 	label := firstNonEmpty(entry.Title, "Meta")
 	text := label
 	if strings.TrimSpace(entry.Content) != "" {
@@ -527,7 +783,105 @@ func renderMetaEntry(entry claude.Entry, width int) string {
 	if !entry.Timestamp.IsZero() {
 		text += "  " + formatTime(entry.Timestamp)
 	}
-	return metaStyle.Render(wrapText(text, width))
+	return wrapDetailText(text, width, detailLineMeta)
+}
+
+func findDetailMatches(lines []detailLine, query string) []detailMatch {
+	queryRunes := []rune(query)
+	if len(queryRunes) == 0 {
+		return nil
+	}
+
+	matches := make([]detailMatch, 0)
+	for lineIndex, line := range lines {
+		lineRunes := []rune(line.text)
+		for start := 0; start+len(queryRunes) <= len(lineRunes); start++ {
+			if !strings.EqualFold(string(lineRunes[start:start+len(queryRunes)]), query) {
+				continue
+			}
+			matches = append(matches, detailMatch{
+				line:  lineIndex,
+				start: start,
+				end:   start + len(queryRunes),
+			})
+			start += len(queryRunes) - 1
+		}
+	}
+
+	return matches
+}
+
+func groupMatchesByLine(matches []detailMatch) map[int][]detailMatch {
+	if len(matches) == 0 {
+		return nil
+	}
+
+	grouped := make(map[int][]detailMatch, len(matches))
+	for index, match := range matches {
+		grouped[match.line] = append(grouped[match.line], detailMatch{
+			line:  index,
+			start: match.start,
+			end:   match.end,
+		})
+	}
+	return grouped
+}
+
+func renderDetailLine(line detailLine, matches []detailMatch, activeMatch int) string {
+	base := detailLineStyle(line.kind)
+	if len(matches) == 0 {
+		return base.Render(line.text)
+	}
+
+	var parts []string
+	runes := []rune(line.text)
+	cursor := 0
+	for _, match := range matches {
+		if match.start > cursor {
+			parts = append(parts, base.Render(string(runes[cursor:match.start])))
+		}
+
+		segment := string(runes[match.start:match.end])
+		style := searchMatchStyle
+		if match.line == activeMatch {
+			style = searchMatchActiveStyle
+		}
+		parts = append(parts, style.Render(segment))
+		cursor = match.end
+	}
+
+	if cursor < len(runes) {
+		parts = append(parts, base.Render(string(runes[cursor:])))
+	}
+
+	return strings.Join(parts, "")
+}
+
+func detailLineStyle(kind detailLineKind) lipgloss.Style {
+	switch kind {
+	case detailLineTitle:
+		return titleStyle
+	case detailLineSectionTitle:
+		return sectionTitleStyle
+	case detailLineMuted, detailLinePromptHeader, detailLineAssistantHeader, detailLineToolCallHeader, detailLineToolResultHeader:
+		return mutedStyle
+	case detailLinePromptBody:
+		return promptBlockStyle
+	case detailLineAssistantBody:
+		return assistantBlockStyle
+	case detailLineToolCallBody:
+		return toolCallStyle
+	case detailLineToolResultBody:
+		return toolResultStyle
+	case detailLineToolErrorBody:
+		return toolErrorStyle
+	case detailLineProgress:
+		return progressStyle
+	case detailLineMeta:
+		return metaStyle
+	default:
+		return lipgloss.NewStyle()
+	}
 }
 
 func firstNonEmpty(values ...string) string {

@@ -71,6 +71,10 @@ ccsessions --debug
 - Type to filter sessions
 - `Tab` to cycle focus between search, session list, and session log
 - `j` / `k` or arrow keys to move in the session list or scroll the session log when that pane is focused
+- `/` in the session log pane to open inline search
+- `up` / `down` in session log search to move between matches
+- `Enter` to keep the current session log search active
+- `Esc` to clear the current session log search
 - `q` to quit
 
 ## Notes
